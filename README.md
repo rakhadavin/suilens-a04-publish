@@ -1,3 +1,6 @@
+# GET STARTED
+run ```bash setup-script/sh``` at terminal build up docker, migrate db, and seeding in one time. 
+
 # SuiLens Microservices Workspace
 
 Workspace ini berisi frontend observability dashboard dan empat backend service yang saling terhubung melalui HTTP dan event RabbitMQ.
