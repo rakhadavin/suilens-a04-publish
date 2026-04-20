@@ -6,11 +6,12 @@ import { orders } from "./db/schema";
 import { eq } from "drizzle-orm";
 import { publishEvent } from "./events";
 import { releaseInventory, reserveInventory } from "./inventory";
+import opentelemetry from "@opentelemetry/api";
+import "./observability/instrumentation";
 
-const CATALOG_SERVICE_URL =
-  process.env.CATALOG_SERVICE_URL || "http://localhost:3001";
+const CATALOG_SERVICE_URL = process.env.CATALOG_SERVICE_URL || "http://localhost:3001";
 const DEFAULT_BRANCH_CODE = process.env.DEFAULT_BRANCH_CODE || "KB-JKT-S";
-
+const tracer = opentelemetry.trace.getTracer("order-service-tracer", "0.1.0");
 interface CatalogLens {
   id: string;
   modelName: string;
@@ -75,79 +76,76 @@ const app = new Elysia()
   .post(
     "/api/orders",
     async ({ body, status }) => {
-      const lensResponse = await fetch(
-        `${CATALOG_SERVICE_URL}/api/lenses/${body.lensId}`,
-      );
-      if (!lensResponse.ok) {
-        return status(404, { error: "Lens not found" });
-      }
-      const lens = (await lensResponse.json()) as CatalogLens;
+      return tracer.startActiveSpan("create-order", async (span) => {
+        const lensResponse = await fetch(`${CATALOG_SERVICE_URL}/api/lenses/${body.lensId}`);
+        if (!lensResponse.ok) {
+          return status(404, { error: "Lens not found" });
+        }
+        const lens = (await lensResponse.json()) as CatalogLens;
 
-      const start = new Date(body.startDate);
-      const end = new Date(body.endDate);
-      const days = Math.ceil(
-        (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24),
-      );
-      if (days <= 0) {
-        return status(400, { error: "End date must be after start date" });
-      }
-      const totalPrice = (days * parseFloat(lens.dayPrice)).toFixed(2);
-      const branchCode = body.branchCode || DEFAULT_BRANCH_CODE;
-      const quantity = 1;
-      const orderId = crypto.randomUUID();
+        const start = new Date(body.startDate);
+        const end = new Date(body.endDate);
+        const days = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+        if (days <= 0) {
+          return status(400, { error: "End date must be after start date" });
+        }
+        const totalPrice = (days * parseFloat(lens.dayPrice)).toFixed(2);
+        const branchCode = body.branchCode || DEFAULT_BRANCH_CODE;
+        const quantity = 1;
+        const orderId = crypto.randomUUID();
 
-      const reservation = await reserveInventory({
-        orderId,
-        lensId: body.lensId,
-        branchCode,
-        quantity,
-      });
-
-      if (!reservation.ok) {
-        return status(reservation.status, { error: reservation.error });
-      }
-
-      const [order] = await db
-        .insert(orders)
-        .values({
-          id: orderId,
-          customerName: body.customerName,
-          customerEmail: body.customerEmail,
+        const reservation = await reserveInventory({
+          orderId,
           lensId: body.lensId,
           branchCode,
           quantity,
-          lensSnapshot: {
-            modelName: lens.modelName,
-            manufacturerName: lens.manufacturerName,
-            dayPrice: lens.dayPrice,
-          },
-          startDate: start,
-          endDate: end,
-          totalPrice,
-        })
-        .returning();
-      if (!order) {
-        await releaseInventory(orderId);
-        return status(500, { error: "Failed to create order" });
-      }
+        });
 
-      await publishEvent("order.placed", {
-        orderId: order.id,
-        customerName: body.customerName,
-        customerEmail: body.customerEmail,
-        lensName: lens.modelName,
-        branchCode,
-        quantity,
+        if (!reservation.ok) {
+          return status(reservation.status, { error: reservation.error });
+        }
+
+        const [order] = await db
+          .insert(orders)
+          .values({
+            id: orderId,
+            customerName: body.customerName,
+            customerEmail: body.customerEmail,
+            lensId: body.lensId,
+            branchCode,
+            quantity,
+            lensSnapshot: {
+              modelName: lens.modelName,
+              manufacturerName: lens.manufacturerName,
+              dayPrice: lens.dayPrice,
+            },
+            startDate: start,
+            endDate: end,
+            totalPrice,
+          })
+          .returning();
+        if (!order) {
+          await releaseInventory(orderId);
+          return status(500, { error: "Failed to create order" });
+        }
+
+        await publishEvent("order.placed", {
+          orderId: order.id,
+          customerName: body.customerName,
+          customerEmail: body.customerEmail,
+          lensName: lens.modelName,
+          branchCode,
+          quantity,
+        });
+
+        return status(201, serializeOrder(order));
       });
-
-      return status(201, serializeOrder(order));
     },
     {
       detail: {
         tags: ["Orders"],
         summary: "Create order",
-        description:
-          "Creates a rental order after validating the requested lens against the catalog service.",
+        description: "Creates a rental order after validating the requested lens against the catalog service.",
       },
       body: t.Object({
         customerName: t.String(),
@@ -185,10 +183,7 @@ const app = new Elysia()
   .get(
     "/api/orders/:id",
     async ({ params, status }) => {
-      const results = await db
-        .select()
-        .from(orders)
-        .where(eq(orders.id, params.id));
+      const results = await db.select().from(orders).where(eq(orders.id, params.id));
       if (!results[0]) {
         return status(404, { error: "Order not found" });
       }
@@ -208,22 +203,18 @@ const app = new Elysia()
       },
     },
   )
-  .get(
-    "/health",
-    () => ({ status: "ok", service: "order-service" }),
-    {
-      detail: {
-        tags: ["Orders"],
-        summary: "Health check",
-      },
-      response: {
-        200: t.Object({
-          status: t.String(),
-          service: t.String(),
-        }),
-      },
+  .get("/health", () => ({ status: "ok", service: "order-service" }), {
+    detail: {
+      tags: ["Orders"],
+      summary: "Health check",
     },
-  )
+    response: {
+      200: t.Object({
+        status: t.String(),
+        service: t.String(),
+      }),
+    },
+  })
   .listen(3002);
 
 console.log(`Order Service running on port ${app.server?.port}`);

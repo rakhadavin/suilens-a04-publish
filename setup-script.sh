@@ -2,7 +2,9 @@
 set -e
 
 echo "===> Start docker containers"
-docker compose up --build -d
+docker compose down -v
+docker compose build --no-cache
+docker compose up
 
 echo "===> Catalog service: install + migrate"
 cd services/catalog-service

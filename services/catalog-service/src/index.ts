@@ -4,7 +4,10 @@ import { swagger } from "@elysiajs/swagger";
 import { db } from "./db";
 import { lenses } from "./db/schema";
 import { eq } from "drizzle-orm";
+import opentelemetry, { type Span } from "@opentelemetry/api";
+import "./observability/instrumentation";
 
+const tracer = opentelemetry.trace.getTracer("catalog-service-tracer", "0.1.0");
 const lensResponse = t.Object({
   id: t.String({ format: "uuid" }),
   modelName: t.String(),
@@ -49,8 +52,22 @@ const app = new Elysia()
   .get(
     "/api/lenses",
     async () => {
-      const results = await db.select().from(lenses);
-      return results.map(serializeLens);
+      return tracer.startActiveSpan("list-lenses", async (span: Span) => {
+        try {
+          const results = await db.select().from(lenses);
+          span.setAttribute("db.operation", "select");
+          span.setAttribute("resource.name", "lenses");
+          span.setAttribute("result.count", results.length);
+
+          return results.map(serializeLens);
+        } catch (error) {
+          span.recordException(error as Error);
+          span.setStatus({ code: 2, message: "Failed to list lenses" });
+          throw error;
+        } finally {
+          span.end();
+        }
+      });
     },
     {
       detail: {
@@ -66,10 +83,7 @@ const app = new Elysia()
   .get(
     "/api/lenses/:id",
     async ({ params, status }) => {
-      const results = await db
-        .select()
-        .from(lenses)
-        .where(eq(lenses.id, params.id));
+      const results = await db.select().from(lenses).where(eq(lenses.id, params.id));
       if (!results[0]) {
         return status(404, { error: "Lens not found" });
       }
@@ -90,22 +104,18 @@ const app = new Elysia()
       },
     },
   )
-  .get(
-    "/health",
-    () => ({ status: "ok", service: "catalog-service" }),
-    {
-      detail: {
-        tags: ["Catalog"],
-        summary: "Health check",
-      },
-      response: {
-        200: t.Object({
-          status: t.String(),
-          service: t.String(),
-        }),
-      },
+  .get("/health", () => ({ status: "ok", service: "catalog-service" }), {
+    detail: {
+      tags: ["Catalog"],
+      summary: "Health check",
     },
-  )
+    response: {
+      200: t.Object({
+        status: t.String(),
+        service: t.String(),
+      }),
+    },
+  })
   .listen(3001);
 
 console.log(`Catalog Service running on port ${app.server?.port}`);
